@@ -5,11 +5,11 @@ from PIL import Image
 from rembg import remove
 
 RAMP = " .`:-=+*cs#%@"
-COLS, FONT, CHAR_W = 90, 12.9, 7.74
+COLS, FONT, CHAR_W = 100, 12.9, 7.74
 LINE_H = CHAR_W / 0.48
 GAMMA, CLIP = 1.25, 4.0
 CROP = (55, 100, 405, 375)  # (left, top, right, bottom) in source pixels
-FLOOR = 0.26  # minimum ink inside the subject, so pale subjects keep a silhouette
+FLOOR = 0.18  # minimum ink inside the subject, so pale subjects keep a silhouette
 EDGE = 0.55  # weight of the edge layer; helps pale subjects
 
 def grabcut(rgb):
@@ -32,17 +32,23 @@ def rows_from(path):
     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     g = cv2.bilateralFilter(g, 9, 60, 60)
     g = cv2.createCLAHE(clipLimit=CLIP, tileGridSize=(8, 8)).apply(g)
-    v = (g / 255.0) ** GAMMA
+    inside = g[alpha > 0.5]
+    lo, hi = np.percentile(inside, (2, 98))
+    t = np.clip((g - lo) / max(hi - lo, 1), 0, 1)       # tone stretched over the subject only
     blur = cv2.GaussianBlur(g, (0, 0), 2.2).astype(float)
     dog = np.clip((blur - cv2.GaussianBlur(g, (0, 0), 0.8)) / 14.0, 0, 1)
-    v = np.clip(v - EDGE * dog, 0, 1)
-    ink = FLOOR + (1 - FLOOR) * (1 - v)
-    v = 1 - ink * alpha                     # outside subject -> white (blank)
-    h, w = v.shape
+    t = np.clip(t - EDGE * dog, 0, 1)
+    h, w = t.shape
     rows = max(1, int(COLS * (h / w) * 0.48))
-    small = cv2.resize(v, (COLS, rows), interpolation=cv2.INTER_AREA)
-    idx = ((1 - small) * (len(RAMP) - 1)).round().astype(int)
-    return ["".join(RAMP[i] for i in r).rstrip() for r in idx]
+
+    def to_rows(density):                    # density 0..1 -> text rows
+        small = cv2.resize(density, (COLS, rows), interpolation=cv2.INTER_AREA)
+        idx = (small.clip(0, 1) * (len(RAMP) - 1)).round().astype(int)
+        return ["".join(RAMP[i] for i in r).rstrip() for r in idx]
+
+    neg = alpha * (FLOOR + (1 - FLOOR) * (1 - t ** GAMMA))   # light theme: shadows are ink
+    pos = alpha * (0.04 + 0.96 * t ** 1.5)                   # dark theme: light is ink
+    return to_rows(neg), to_rows(pos)
 
 def font_b64(ttf, chars):
     import subprocess, tempfile, os
@@ -53,20 +59,23 @@ def font_b64(ttf, chars):
 
 def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def build(rows, ttf, fill="#e6e6e6"):
-    W, H = COLS * CHAR_W, len(rows) * LINE_H + 8
+def build(layers, ttf):
+    neg, pos = layers
+    n = len(neg)
+    W, H = COLS * CHAR_W, n * LINE_H + 8
     b64 = font_b64(ttf, RAMP)
-    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.2f} {H:.2f}" role="img" aria-label="ASCII portrait">',
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.2f} {H:.2f}" role="img" aria-label="ASCII portrait of a cat wearing glasses">',
          f'<defs><style>@font-face{{font-family:"M";src:url(data:font/woff2;base64,{b64}) format("woff2")}}'
-         f'text{{font-family:"M",monospace;font-size:{FONT}px;fill:#24292f;white-space:pre}}.k{{fill:#24292f}}'
-         f'@media(prefers-color-scheme:dark){{text,.k{{fill:#e6edf3}}}}</style>']
-    for i in range(len(rows)):
+         f'text{{font-family:"M",monospace;font-size:{FONT}px;fill:#24292f;white-space:pre}}.k{{fill:#24292f}}.p{{display:none}}'
+         f'@media(prefers-color-scheme:dark){{text,.k{{fill:#e6edf3}}.p{{display:inline}}.n{{display:none}}}}</style>']
+    for i in range(n):
         o.append(f'<clipPath id="c{i}"><rect x="0" y="{i*LINE_H:.2f}" width="0" height="{LINE_H+2:.2f}">'
                  f'<animate attributeName="width" from="0" to="{W:.2f}" dur="0.9s" begin="{i*0.09:.2f}s" fill="freeze"/></rect></clipPath>')
     o.append("</defs>")
-    for i, r in enumerate(rows):
+    for i in range(n):
         y = (i + 1) * LINE_H - 3
-        o.append(f'<text x="0" y="{y:.2f}" xml:space="preserve" clip-path="url(#c{i})">{esc(r)}</text>')
+        for cls, rows in (("n", neg), ("p", pos)):
+            o.append(f'<text class="{cls}" x="0" y="{y:.2f}" xml:space="preserve" clip-path="url(#c{i})">{esc(rows[i])}</text>')
         o.append(f'<rect width="{CHAR_W:.2f}" height="{LINE_H-2:.2f}" x="0" y="{i*LINE_H+1:.2f}" class="k" opacity="0">'
                  f'<set attributeName="opacity" to="0.9" begin="{i*0.09:.2f}s"/>'
                  f'<animate attributeName="x" from="0" to="{W:.2f}" dur="0.9s" begin="{i*0.09:.2f}s" fill="freeze"/>'
@@ -76,7 +85,7 @@ def build(rows, ttf, fill="#e6e6e6"):
 
 if __name__ == "__main__":
     photo, ttf, out = sys.argv[1:4]
-    rows = rows_from(photo)
-    open(out.replace(".svg", ".txt"), "w").write("\n".join(rows))
-    open(out, "w").write(build(rows, ttf))
-    print(len(rows), "rows")
+    layers = rows_from(photo)
+    open(out.replace(".svg", ".txt"), "w").write("\n".join(layers[1]))
+    open(out, "w").write(build(layers, ttf))
+    print(len(layers[0]), "rows")
