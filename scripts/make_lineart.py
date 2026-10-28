@@ -1,7 +1,8 @@
 """Photo -> line drawing -> ASCII by glyph matching -> typing-animation SVG (hd-portrait.svg).
 
-Detected edges give the glasses, eyes and whiskers. The head outline, ears and mouth are
-too low-contrast in the source photo, so they are traced by hand below (source pixels).
+Detected edges and dark areas give the glasses and eyes. The head outline, ears, nose, mouth
+and whiskers are too low-contrast in the source photo, so they are traced by hand below
+(source pixels).
 """
 import sys
 import numpy as np, cv2
@@ -19,10 +20,15 @@ EAR_L = [(110, 148), (80, 110), (140, 128)]
 EAR_R = [(330, 125), (373, 102), (379, 148)]
 FOREHEAD = [(140, 128), (190, 122), (250, 121), (300, 122), (330, 125)]
 INNER_EARS = [[(92, 121), (118, 139)], [(365, 113), (346, 131)]]
-MOUTH = [[(246, 242), (247, 272)], [(214, 284), (231, 289), (247, 278), (263, 289), (281, 284)]]
+MOUTH = [[(247, 240), (247, 272)], [(214, 284), (231, 289), (247, 278), (263, 289), (281, 284)]]
+NOSE = [(222, 211), (235, 206), (247, 205), (259, 206), (272, 211), (262, 226), (250, 240), (244, 240),
+        (232, 226), (222, 211)]
+WHISKERS = [[(206, 250), (150, 247), (90, 252), (40, 262)], [(206, 258), (140, 264), (80, 280), (40, 296)],
+            [(209, 266), (150, 287), (100, 312), (60, 340)],
+            [(288, 248), (345, 243), (405, 248), (455, 258)], [(288, 256), (355, 262), (415, 278), (455, 294)],
+            [(285, 264), (345, 285), (395, 310), (440, 338)]]
 EYES = [((175, 185), 22), ((312, 180), 22)]
-WHISKER_BAND = (222, 395)            # y range where edges outside the head are kept
-CLOTH = (0, 215, 118, 280)           # crumpled sheet left of the head: not whiskers
+SPECULAR = 5                         # catchlight radius, up and right of each pupil centre
 GLASSES = (100, 138, 382, 238)       # frame box: drawn from its centreline, not its two edges
 
 
@@ -51,7 +57,7 @@ def line_image(path):
     h, w = img.shape[:2]
     g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # detected edges, kept inside the head or as whiskers in the band beside it
+    # detected edges, kept inside the head
     big = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     e = cv2.Canny(cv2.GaussianBlur(cv2.bilateralFilter(big, 9, 40, 40), (0, 0), 2.0), 35, 90)
     e = cv2.resize(e, (w, h), interpolation=cv2.INTER_AREA) > 40
@@ -59,17 +65,14 @@ def line_image(path):
     cv2.fillPoly(head, [np.array(EAR_L + FOREHEAD + EAR_R + HEAD[::-1], np.int32)], 1)
     gx0, gy0, gx1, gy1 = GLASSES
     e[gy0:gy1, gx0:gx1] = False
-    cx0, cy0, cx1, cy1 = CLOTH
-    e[cy0:cy1, cx0:cx1] = False
+    e[:140, :] = False                         # the TV behind the ears
     keep = np.zeros((h, w), bool)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(e.astype(np.uint8), connectivity=8)
     for i in range(1, n):
         x, y, bw, bh, area = stats[i]
         comp = lab == i
-        if (comp & (head > 0)).sum() > 0.6 * area:
+        if (comp & (head > 0)).sum() > 0.6 * area and area > 6:
             keep |= comp
-        elif WHISKER_BAND[0] < y and y + bh < WHISKER_BAND[1] and bw > 3.5 * bh and bw > 22:
-            keep |= comp                       # long, flat strokes: whiskers, not door frames
 
     S = 3                                      # matching resolution: one source px -> 3 px
     canvas = Image.new("L", (w * S, h * S), 0)
@@ -93,19 +96,13 @@ def line_image(path):
         d.line(q, fill=255, width=width, joint="curve")
 
     stroke(HEAD); stroke(EAR_L); stroke(EAR_R); stroke(FOREHEAD)
-    for s in INNER_EARS + MOUTH:
+    for s in INNER_EARS:
         stroke(s, 3)
-
-    # nose: the pink patch, found on the Lab a* channel
-    a = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)[:, :, 1].astype(float)
-    nose = np.zeros((h, w), np.uint8)
-    roi = a[195:250, 210:285]
-    nose[195:250, 210:285] = (roi > np.percentile(roi, 72)).astype(np.uint8)
-    nose = cv2.morphologyEx(nose, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    cs, _ = cv2.findContours(nose, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if cs:
-        c = max(cs, key=cv2.contourArea)[:, 0, :]
-        d.line([(x * S, y * S) for x, y in np.vstack([c, c[:1]])], fill=255, width=3)
+    for s in MOUTH:
+        stroke(s, 2)
+    for s in WHISKERS:
+        stroke(s, 2)
+    d.line([(x * S, y * S) for x, y in NOSE], fill=255, width=3, joint="curve")
 
     # pupils: solid, so the eyes read from a distance
     for (cx, cy), r in EYES:
@@ -116,6 +113,8 @@ def line_image(path):
         canvas_np[cv2.resize(pupil, (w * S, h * S), interpolation=cv2.INTER_NEAREST) > 0] = 255
         canvas = Image.fromarray(canvas_np)
         d = ImageDraw.Draw(canvas)
+        hx, hy = (cx + 7) * S, (cy - 7) * S
+        d.ellipse([hx - SPECULAR * S, hy - SPECULAR * S, hx + SPECULAR * S, hy + SPECULAR * S], fill=0)
 
     canvas_np = np.array(canvas)
     canvas_np[sk > 0] = 255
