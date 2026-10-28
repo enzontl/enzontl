@@ -29,6 +29,8 @@ WHISKERS = [[(206, 250), (150, 247), (90, 252), (40, 262)], [(206, 258), (140, 2
             [(285, 264), (345, 285), (395, 310), (440, 338)]]
 EYES = [((175, 185), 22), ((312, 180), 22)]
 SPECULAR = 5                         # catchlight radius, up and right of each pupil centre
+NOSE_TIP = (247, 222)                # fur texture leans away from here
+FUR_BASE, FUR_GAIN = 0.10, 0.55     # chance of a fur mark: base everywhere in the head, plus shade
 GLASSES = (100, 138, 382, 238)       # frame box: drawn from its centreline, not its two edges
 
 
@@ -119,8 +121,15 @@ def line_image(path):
     canvas_np = np.array(canvas)
     canvas_np[sk > 0] = 255
     canvas = Image.fromarray(canvas_np)
+    # shade for the fur texture: darker fur inside the head, glasses left bare
+    inside = g[head > 0]
+    lo, hi = np.percentile(inside, (5, 95))
+    shade = np.clip((hi - cv2.GaussianBlur(g, (0, 0), 3).astype(float)) / max(hi - lo, 1), 0, 1) * head
+    for (cx, cy), r in EYES:                   # keep the lenses clean around the pupils
+        cv2.circle(shade, (cx, cy), r + 18, 0, -1)
+
     l, t, r, b = CROP
-    return np.array(canvas.crop((l * S, t * S, r * S, b * S)))
+    return np.array(canvas.crop((l * S, t * S, r * S, b * S))), shade[t:b, l:r]
 
 
 def glyph_bank(ttf):
@@ -133,23 +142,50 @@ def glyph_bank(ttf):
     return np.stack(bank)
 
 
-def to_rows(lines, ttf):
+def fur(v, r, c, nr, nc, rng):
+    """A light mark for a bare cell inside the head, following fur that grows out from the nose."""
+    if v <= 0 or rng.random() > FUR_BASE + FUR_GAIN * v:
+        return " "
+    if v > 0.75 and rng.random() < 0.5:
+        return ":" if rng.random() < 0.6 else ";"
+    dx, dy = c - nc, (r - nr) * 2.1          # rows are about twice as tall as columns
+    if abs(dx) > 2.2 * abs(dy):              # cheeks and whisker pads: fur runs sideways
+        return "-" if rng.random() < 0.2 else ("." if dy > 0 else "`")
+    if abs(dy) > 2.2 * abs(dx):              # forehead and chin: fur runs up and down
+        return "'" if dy < 0 else ","
+    if (dx > 0) == (dy > 0):                 # down-right or up-left
+        return "\\" if rng.random() < 0.12 else ("," if dy > 0 else "`")
+    return "/" if rng.random() < 0.12 else ("." if dy > 0 else "'")
+
+
+def to_rows(lines, shade, ttf):
     bank = glyph_bank(ttf)
     lines = cv2.resize(lines, (COLS * CELL_W, int(round(lines.shape[0] * COLS * CELL_W / lines.shape[1]))))
     rows = lines.shape[0] // CELL_H
     src = cv2.GaussianBlur(lines.astype(float) / 255, (0, 0), 1.6)
-    out = []
+    grid = [[" "] * COLS for _ in range(rows)]
     for r in range(rows):
-        line = ""
         for c in range(COLS):
             cell = src[r * CELL_H:(r + 1) * CELL_H, c * CELL_W:(c + 1) * CELL_W]
             if cell.max() < 0.12:
-                line += " "
                 continue
             err = ((bank - cell) ** 2).sum(axis=(1, 2))
             err[0] *= 1.15                     # nudge faint cells toward a glyph rather than blank
-            line += GLYPHS[int(err.argmin())]
-        out.append(line.rstrip())
+            grid[r][c] = GLYPHS[int(err.argmin())]
+
+    # fur texture in bare cells, kept one cell clear of every line so outlines stay crisp
+    sh = cv2.resize(shade, (COLS, rows), interpolation=cv2.INTER_AREA)
+    l, t, rr, b = CROP
+    nc = int((NOSE_TIP[0] - l) / (rr - l) * COLS)
+    nr = int((NOSE_TIP[1] - t) / (b - t) * rows)
+    drawn = np.array([[ch != " " for ch in row] for row in grid])
+    near = cv2.dilate(drawn.astype(np.uint8), np.ones((1, 3), np.uint8)) > 0
+    rng = np.random.default_rng(7)             # fixed seed: same texture on every run
+    for r in range(rows):
+        for c in range(COLS):
+            if not near[r, c]:
+                grid[r][c] = fur(sh[r, c], r, c, nr, nc, rng)
+    out = ["".join(row).rstrip() for row in grid]
     while out and not out[-1]:
         out.pop()
     return out
@@ -157,7 +193,7 @@ def to_rows(lines, ttf):
 
 if __name__ == "__main__":
     photo, ttf, out = sys.argv[1:4]
-    rows = to_rows(line_image(photo), ttf)
+    rows = to_rows(*line_image(photo), ttf)
     open(out.replace(".svg", ".txt"), "w").write("\n".join(rows))
     open(out, "w").write(build((rows, rows), ttf))
     print(len(rows), "rows")
