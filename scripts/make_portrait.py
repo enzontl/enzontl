@@ -8,9 +8,20 @@ RAMP = " .`:-=+*cs#%@"
 COLS, FONT, CHAR_W = 100, 12.9, 7.74
 LINE_H = CHAR_W / 0.48
 GAMMA, CLIP = 1.25, 4.0
-CROP = (55, 100, 405, 375)  # (left, top, right, bottom) in source pixels
+CROP = (45, 70, 415, 395)  # (left, top, right, bottom) in source pixels
 FLOOR = 0.18  # minimum ink inside the subject, so pale subjects keep a silhouette
-EDGE = 0.55  # weight of the edge layer; helps pale subjects
+EDGE = 0.8  # weight of the edge layer; helps pale subjects
+
+# ears and forehead, in CROP coordinates; GrabCut alone clips them off
+HEAD = [(37, 60), (95, 72), (165, 64), (240, 66), (285, 66), (334, 31), (322, 112), (290, 104),
+        (100, 104), (58, 104)]
+
+
+def poly_mask(shape):
+    m = np.zeros(shape, np.uint8)
+    cv2.fillPoly(m, [np.array(HEAD, np.int32)], 1)
+    return cv2.GaussianBlur(m.astype(float), (0, 0), 1.5)
+
 
 def grabcut(rgb):
     h, w = rgb.shape[:2]
@@ -28,7 +39,7 @@ def rows_from(path):
     alpha = np.array(cut)[:, :, 3] / 255.0
     rgb = np.array(img)
     if alpha.mean() < 0.25:                 # rembg latched onto an accessory (glasses): GrabCut the whole subject
-        alpha = grabcut(rgb)
+        alpha = np.maximum(grabcut(rgb), poly_mask(rgb.shape[:2]))
     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     g = cv2.bilateralFilter(g, 9, 60, 60)
     g = cv2.createCLAHE(clipLimit=CLIP, tileGridSize=(8, 8)).apply(g)
@@ -47,7 +58,7 @@ def rows_from(path):
         return ["".join(RAMP[i] for i in r).rstrip() for r in idx]
 
     neg = alpha * (FLOOR + (1 - FLOOR) * (1 - t ** GAMMA))   # light theme: shadows are ink
-    pos = alpha * (0.04 + 0.96 * t ** 1.5)                   # dark theme: light is ink
+    pos = alpha * (0.04 + 0.96 * t ** 0.9)                   # dark theme: light is ink
     return to_rows(neg), to_rows(pos)
 
 def font_b64(ttf, chars):
@@ -63,7 +74,9 @@ def build(layers, ttf):
     neg, pos = layers
     n = len(neg)
     W, H = COLS * CHAR_W, n * LINE_H + 8
-    b64 = font_b64(ttf, RAMP)
+    chars = "".join(sorted(set("".join(neg + pos)) | {" "}))
+    b64 = font_b64(ttf, chars)
+    layered = neg is not pos                 # one layer per theme, or a single shared one
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.2f} {H:.2f}" role="img" aria-label="ASCII portrait of a cat wearing glasses">',
          f'<defs><style>@font-face{{font-family:"M";src:url(data:font/woff2;base64,{b64}) format("woff2")}}'
          f'text{{font-family:"M",monospace;font-size:{FONT}px;fill:#24292f;white-space:pre}}.k{{fill:#24292f}}.p{{display:none}}'
@@ -74,8 +87,9 @@ def build(layers, ttf):
     o.append("</defs>")
     for i in range(n):
         y = (i + 1) * LINE_H - 3
-        for cls, rows in (("n", neg), ("p", pos)):
-            o.append(f'<text class="{cls}" x="0" y="{y:.2f}" xml:space="preserve" clip-path="url(#c{i})">{esc(rows[i])}</text>')
+        for cls, rows in ((("n", neg), ("p", pos)) if layered else (("", neg),)):
+            attr = f' class="{cls}"' if cls else ""
+            o.append(f'<text{attr} x="0" y="{y:.2f}" xml:space="preserve" clip-path="url(#c{i})">{esc(rows[i])}</text>')
         o.append(f'<rect width="{CHAR_W:.2f}" height="{LINE_H-2:.2f}" x="0" y="{i*LINE_H+1:.2f}" class="k" opacity="0">'
                  f'<set attributeName="opacity" to="0.9" begin="{i*0.09:.2f}s"/>'
                  f'<animate attributeName="x" from="0" to="{W:.2f}" dur="0.9s" begin="{i*0.09:.2f}s" fill="freeze"/>'
